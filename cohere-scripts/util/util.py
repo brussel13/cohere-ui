@@ -34,7 +34,8 @@ __all__ = ['read_tif',
            'get_gpu_load',
            'get_gpu_distribution',
            'estimate_no_proc',
-           'normalize'
+           'normalize',
+           'run_with_mpi'
            ]
 
 
@@ -348,7 +349,7 @@ def remove_ramp(arr, ups=1):
     return ramp_removed
 
 
-def get_gpu_load(mem_size, ids):
+def get_gpu_load(mem_size, dev):
     """
     This function is only used when running on Linux OS. The GPUtil module is not supported on Mac.
     This function finds available GPU memory in each GPU that id is included in ids list. It calculates
@@ -357,7 +358,7 @@ def get_gpu_load(mem_size, ids):
     ----------
     mem_size : int
         array size
-    ids : list
+    dev : list
         list of GPU ids user configured for use
     Returns
     -------
@@ -368,22 +369,16 @@ def get_gpu_load(mem_size, ids):
 
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     gpus = GPUtil.getGPUs()
-    total_avail = 0
-    available_dir = {}
+    available = {}
+
     for gpu in gpus:
-        if gpu.id in ids:
+        if dev == 'all' or gpu.id in dev:
             free_mem = gpu.memoryFree
             avail_runs = int(free_mem / mem_size)
             if avail_runs > 0:
-                total_avail += avail_runs
-                available_dir[gpu.id] = avail_runs
-    available = []
-    for id in ids:
-        try:
-            avail_runs = available_dir[id]
-        except:
-            avail_runs = 0
-        available.append(avail_runs)
+                available[gpu.id] = avail_runs
+
+    print(available)
     return available
 
 
@@ -403,16 +398,16 @@ def get_gpu_distribution(runs, available):
     """
     from functools import reduce
 
-    all_avail = reduce((lambda x, y: x + y), available)
-    distributed = [0] * len(available)
+    all_avail = reduce((lambda x, y: x + y), available.values())
+    distributed = {k : 0 for k in available.keys()}
     sum_distr = 0
     while runs > sum_distr and all_avail > 0:
         # balance distribution
-        for i in range(len(available)):
-            if available[i] > 0:
-                available[i] -= 1
+        for k in available.keys():
+            if available[k] > 0:
+                available[k] -= 1
                 all_avail -= 1
-                distributed[i] += 1
+                distributed[k] += 1
                 sum_distr += 1
                 if sum_distr == runs:
                     break
@@ -448,5 +443,27 @@ def estimate_no_proc(arr_size, factor):
 
 def normalize(vec):
     return vec / np.linalg.norm(vec)
+
+
+def run_with_mpi(hosts, hosts_no, devs, recon_mem):
+    import subprocess
+    import ast
+
+    script = 'get_gpu_load'
+    if devs != 'all':
+        devs = ast.literal_eval(devs)
+    command = ['mpiexec', '-n', str(hosts_no), '--host', hosts, 'python', script, str(recon_mem), devs]
+    result = subprocess.run(command, stdout=subprocess.PIPE)
+    mem = result.stdout.decode("utf-8").strip()
+    mem_map = {}
+    for line in mem.splitlines():
+        print(line)
+        entry = line.split(" ", 1)
+        print('entry', entry)
+        mem_map[entry[0]] = ast.literal_eval(entry[1])
+    print(mem_map)
+    return mem_map
+
+
 
 

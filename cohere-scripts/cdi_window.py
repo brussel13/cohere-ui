@@ -1073,11 +1073,16 @@ class RecTab(QWidget):
         if len(self.proc.currentText()) > 0:
             conf_map['processing'] = str(self.proc.currentText())
         if len(self.device.text()) > 0:
-            try:
-                conf_map['device'] = ast.literal_eval(str(self.device.text()).replace('\n',''))
-            except:
-                msg_window('device parameter should be a list of int')
-                return {}
+            dev = str(self.device.text()).strip()
+            print(dev, type(dev))
+            if dev == 'all':
+                conf_map['device'] = dev
+            else:
+                try:
+                    conf_map['device'] = ast.literal_eval(str(self.device.text()).replace('\n',''))
+                except:
+                    msg_window('device parameter should be a list of int, "all" or dict with cluster definition')
+                    return {}
         if len(self.alg_seq.text()) > 0:
             conf_map['algorithm_sequence'] = str(self.alg_seq.text()).strip()
         if len(self.hio_beta.text()) > 0:
@@ -1313,7 +1318,7 @@ class RecTab(QWidget):
         else:
             self.reconstructions.setText('1')
             self.proc.setCurrentIndex(0)
-            self.device.setText('[0]')
+            self.device.setText('all')
             self.alg_seq.setText('3*(20*ER+180*HIO)+20*ER')
             self.hio_beta.setText('.9')
             self.initial_support_area.setText('[0.5, 0.5, 0.5]')

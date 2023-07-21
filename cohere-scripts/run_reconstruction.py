@@ -86,9 +86,14 @@ def get_gpu_use(devices, no_dir, no_rec, data_shape, pc_in_use, ga_method):
     """
     from functools import reduce
 
+    no_runs = no_dir * no_rec
     if sys.platform == 'darwin':
         # the gpu library is not working on OSX, so run one reconstruction on each GPU
-        gpu_load = len(devices) * [1, ]
+        try:
+            gpu_load = {dev : [1] for dev in devices}
+        except:
+            print('on Darwin platform the available devices must be entered as list')
+            return [-1]
     else:
         # find size of data array
         data_size = reduce((lambda x, y: x * y), data_shape) / 1000000.
@@ -97,31 +102,64 @@ def get_gpu_use(devices, no_dir, no_rec, data_shape, pc_in_use, ga_method):
         if ga_method is not None:
             if ga_method == 'fast':
                 mem_factor = GA_FAST_MEM_FACTOR
-                c = 428
+                c = 430
             else:
                 mem_factor = GA_MEM_FACTOR
         rec_mem_size = data_size * mem_factor + c
         if pc_in_use:
             rec_mem_size = rec_mem_size * 2
-        gpu_load = ut.get_gpu_load(rec_mem_size, devices)
+        if type(devices) == dict: # a cluster with multiple hosts
+            hosts = ','.join(devices.keys())
+            # memory map returns dict with hosts keys, and value a dict of
+            # gpu Id/available runs
+            mem_map = ut.run_with_mpi(hosts, len(devices), devices, rec_mem_size)
+            # calculate number available runs on each host and distribute the no_runs
+            # proportionally
+            host_available = {}
+            for host in mem_map.keys():
+                host_available[host] = reduce((lambda x, y: x + y), mem_map[host].values())
+            total_hosts_available = reduce((lambda x, y: x + y), host_available.values())
+            if total_hosts_available > no_rec:
+                factor = no_rec * 1.0 / total_hosts_available
+            if factor < 1:
+                accounted = 0
+                host_allocated = {}
+                for host in host_available:
+                    host_allocated[host] = int(factor * host_available[host])
+                    accounted += host_allocated[host]
+                # need allocate more to account for the fraction
+                need_allocate = no_rec - accounted
+                for host in host_available:
+                    if host_allocated[host] < host_available[host]:
+                        host_allocated[host] += 1
+                        need_allocate -= 1
+                        if need_allocate == 0:
+                            break
+            else:
+                host_allocated = host_available
+            # get distribution between GPUs on each host
+            gpu_use = {}
+            for host in host_allocated:
+                gpu_distribution = ut.get_gpu_distribution(no_runs, host_allocated[host])
+                gpu_use[host] = sum([[k]*v for k,v in gpu_distribution.items()],[])
+            return gpu_use
+        else: # the processing runs on one machine
+            gpu_load = ut.get_gpu_load(rec_mem_size, devices)
+            gpu_distribution = ut.get_gpu_distribution(no_runs, gpu_load)
+            print('distr', gpu_distribution)
+            ids = list(gpu_distribution.keys())
+            gpu_use = []
+            while len(ids) > 0:
+                to_remove = [id for id in ids if gpu_distribution[id] == 0]
+                ids = [id for id in ids if id not in to_remove]
+                gpu_use.extend(ids)
+                for id in ids:
+                    gpu_distribution[id] -=1
 
-    no_runs = no_dir * no_rec
-    gpu_distribution = ut.get_gpu_distribution(no_runs, gpu_load)
-    gpu_use = []
-    available = reduce((lambda x, y: x + y), gpu_distribution)
-    dev_index = 0
-    i = 0
-    while i < available:
-        if gpu_distribution[dev_index] > 0:
-            gpu_use.append(devices[dev_index])
-            gpu_distribution[dev_index] = gpu_distribution[dev_index] - 1
-            i += 1
-        dev_index += 1
-        dev_index = dev_index % len(devices)
-    if no_dir > 1:
-        gpu_use = [gpu_use[x:x + no_rec] for x in range(0, len(gpu_use), no_rec)]
+            if len(gpu_use) > no_runs:
+                gpu_use = gpu_use[:no_runs]
 
-    return gpu_use
+            return gpu_use
 
 
 def manage_reconstruction(experiment_dir, rec_id=None):
@@ -275,7 +313,6 @@ def manage_reconstruction(experiment_dir, rec_id=None):
                 devices = rec_config_map['device']
             else:
                 devices = [-1]
-
             if no_runs * reconstructions > 1:
                 data_shape = cohere.read_tif(exp_dirs_data[0][0]).shape
                 if generations > 1:
@@ -286,6 +323,15 @@ def manage_reconstruction(experiment_dir, rec_id=None):
                 else:
                     ga_method = None
                 device_use = get_gpu_use(devices, no_runs, reconstructions, data_shape, 'pc' in rec_config_map['algorithm_sequence'], ga_method)
+                # check if cluster configuration
+                if type(device_use) == dict:
+                    host_file = open(experiment_dir + 'hosts.txt', mode='w+')
+                    temp_dev_list = []
+                    for host, devices in device_use.items():
+                        host_file.write(host + ':' + str(len(devices)))
+                        temp_dev_list.extend(devices)
+                    host_file.close()
+                    device_use = temp_dev_listf
             else:
                 device_use = devices
 
