@@ -349,6 +349,22 @@ def remove_ramp(arr, ups=1):
     return ramp_removed
 
 
+def get_best_gpu():
+    import GPUtil
+
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    gpus = GPUtil.getGPUs()
+    best_id = -1
+    best_mem = 0
+
+    for gpu in gpus:
+        free_mem = gpu.memoryFree
+        if free_mem > best_mem:
+            best_mem = free_mem
+            best_id = gpu.id
+
+    return best_id
+
 def get_gpu_load(mem_size, dev):
     """
     This function is only used when running on Linux OS. The GPUtil module is not supported on Mac.
@@ -450,8 +466,6 @@ def run_with_mpi(hosts, hosts_no, devs, recon_mem):
     import ast
 
     script = 'get_gpu_load'
-    if devs != 'all':
-        devs = ast.literal_eval(devs)
     command = ['mpiexec', '-n', str(hosts_no), '--host', hosts, 'python', script, str(recon_mem), devs]
     result = subprocess.run(command, stdout=subprocess.PIPE)
     mem = result.stdout.decode("utf-8").strip()

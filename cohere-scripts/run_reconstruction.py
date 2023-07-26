@@ -25,11 +25,120 @@ from multiprocessing import Process, Queue
 import cohere_core as cohere
 import util.util as ut
 import convertconfig as conv
+from functools import reduce
+import subprocess
+import ast
 
-MEM_FACTOR = 170
-GA_MEM_FACTOR = 250
-GA_FAST_MEM_FACTOR = 184
-ADJUST = 0.0
+
+class Memory_broker:
+    MEM_FACTOR = 170
+    GA_MEM_FACTOR = 250
+    GA_FAST_MEM_FACTOR = 184
+
+    def __init__(self, dev):
+        self.dev = dev
+        if type(self.dev) == dict:
+            self.cluster = True # a cluster with multiple hosts
+        else:
+            self.cluster = False
+
+
+    def get_rec_mem(self, data_shape, ga_method, pc_in_use):
+        # find size of data array
+        data_size = reduce((lambda x, y: x * y), data_shape) / 1000000.
+        mem_factor = Memory_broker.MEM_FACTOR
+        c = 0
+        if ga_method is not None:
+            if ga_method == 'fast':
+                mem_factor = Memory_broker.GA_FAST_MEM_FACTOR
+                c = 430
+            else:
+                mem_factor = Memory_broker.GA_MEM_FACTOR
+        rec_mem_size = data_size * mem_factor + c
+        if pc_in_use:
+            rec_mem_size = rec_mem_size * 2
+
+        return rec_mem_size
+
+
+    def get_mem_map(self, rec_mem_size):
+        if self.cluster: # a cluster with multiple hosts
+            hosts = ','.join(self.dev.keys())
+            script = 'util.mpi_cmd.py'
+            command = ['mpiexec', '-n', str(len(self.dev)), '--host', hosts, 'python', script, str(rec_mem_size), self.dev]
+            result = subprocess.run(command, stdout=subprocess.PIPE)
+            mem = result.stdout.decode("utf-8").strip()
+            mem_map = {}
+            for line in mem.splitlines():
+                entry = line.split(" ", 1)
+                # print('entry', entry)
+                mem_map[entry[0]] = ast.literal_eval(entry[1])
+            # memory map contains dict with hosts keys, and value a dict of
+            # gpu Id/available runs
+            print(mem_map)
+        else:
+            mem_map = ut.get_gpu_load(rec_mem_size, self.dev)
+
+        return mem_map
+
+
+    def get_avail_recs(self, mem_map):
+        if self.cluster:
+            total_avail = 0
+            for host in mem_map.keys():
+                host_available = reduce((lambda x, y: x + y), mem_map[host].values())
+                total_avail = reduce((lambda x, y: x + y), host_available.values())
+        else:
+            total_avail = reduce((lambda x, y: x + y), mem_map.values())
+        return total_avail
+
+
+    def get_best_devs(self, n):
+
+
+
+    def get_assigned_devs(self, no_rec, no_scan_ranges, data_shape, ga_method, pc_in_use):
+        # if there is only one reconstruction find a device in a simplest way
+        if no_rec * no_scan_ranges == 1:
+            if type(self.dev) == list:
+                assigned = self.dev[0]
+            elif self.dev == 'all' or self.cluster:
+                # dah, have to find a gpu and not allow it on darwin
+                # assuming here that if cluster configuration, it includes the  local host
+                if sys.platform == 'darwin':
+                    print('currently not supporting "all" configuration on Darwin')
+                    return [-1]
+                else:
+                    assigned = ut.get_best_gpu()
+            return assigned
+
+        if sys.platform == 'darwin':
+            if self.cluster:
+                print('currently not supporting cluster configuration on Darwin')
+                return [-1]
+            # the gpu library is not working on OSX, so run one reconstruction on each GPU
+            try:
+                self.mem_map = {dev: [1] for dev in self.dev}
+            except:
+                print('on Darwin platform the available devices must be entered as list')
+                return [-1]
+        else:
+            rec_mem_size = self.get_rec_mem(self, data_shape, ga_method, pc_in_use)
+            mem_map = self.get_mem_map(self, rec_mem_size)
+            available_recs = self.get_avail_recs()
+            if available_recs > no_rec * no_scan_ranges:
+                # distribute devices evenly in one list or list of lists for multiple scans
+                pass
+            else:
+                # not enough resources, first serialize the scans reconstructions then
+                # limit number of reconstructions in one scan
+                if no_scan_ranges == 1:
+                    # return all devices in one list
+                    pass
+                else:
+                    # return list of lists
+                    aval_scans = available_recs // no_rec
+                    # distribute into aval_scans number of buckets with no_rec
 
 
 def rec_process(proc, conf_file, datafile, dir, gpus, r, q):
@@ -178,6 +287,17 @@ def manage_reconstruction(experiment_dir, rec_id=None):
     -------
     nothing
     """
+    def manage_scan_range(generations, rec_config_map, reconstructions, lib, conf_file, datafile, dir, device_use):
+        if generations > 1:
+            if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
+                cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
+            else:
+                cohere.reconstruction_populous_GA.reconstruction(lib, conf_file, datafile, dir, device_use)
+        elif reconstructions > 1:
+            cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
+        else:
+            cohere.reconstruction_single.reconstruction(lib, conf_file, datafile, dir, device_use)
+
     print('starting reconstruction')
     experiment_dir = experiment_dir.replace(os.sep, '/')
     # the rec_id is a postfix added to config_rec configuration file. If defined, use this configuration.
@@ -253,6 +373,12 @@ def manage_reconstruction(experiment_dir, rec_id=None):
         print('invalid "proc" value', proc, 'is not supported')
         return
 
+    separate = False
+    if 'separate_scans' in main_config_map and main_config_map['separate_scans']:
+        separate = True
+    if 'separate_scan_ranges' in main_config_map and main_config_map['separate_scan_ranges']:
+        separate = True
+
     # for multipeak reconstruction divert here
     if 'multipeak' in main_config_map and main_config_map['multipeak']:
         config_map = ut.read_config(experiment_dir + "/conf/config_mp")
@@ -271,14 +397,14 @@ def manage_reconstruction(experiment_dir, rec_id=None):
         # exp_dirs_data list hold pairs of data and directory, where the directory is the root of data/data.tif file, and
         # data is the data.tif file in this directory.
         exp_dirs_data = []
-        # experiment may be multi-scan in which case reconstruction will run for each scan
-        for dir in os.listdir(experiment_dir):
-            if dir.startswith('scan') or dir.startswith('mp'):
-                datafile = experiment_dir + '/' + dir + '/phasing_data/data.tif'
-                if os.path.isfile(datafile):
-                    exp_dirs_data.append((datafile, experiment_dir + '/' + dir))
-        # if there are no scan directories, assume it is combined scans experiment
-        if len(exp_dirs_data) == 0:
+        # experiment may be multi-scan in which case reconstruction will run for each scan or scan range
+        if separate:
+            for dir in os.listdir(experiment_dir):
+                if dir.startswith('scan'):
+                    datafile = experiment_dir + '/' + dir + '/phasing_data/data.tif'
+                    if os.path.isfile(datafile):
+                        exp_dirs_data.append((datafile, experiment_dir + '/' + dir))
+        else:
             # in typical scenario data_dir is not configured, and it is defaulted to <experiment_dir>/data
             # the data_dir is ignored in multi-scan scenario
             if 'data_dir' in rec_config_map:
@@ -288,8 +414,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
             datafile = data_dir + '/data.tif'
             if os.path.isfile(datafile):
                 exp_dirs_data.append((datafile, experiment_dir))
-        no_runs = len(exp_dirs_data)
-        if no_runs == 0:
+        no_scan_ranges = len(exp_dirs_data)
+        if no_scan_ranges == 0:
             print('did not find data.tif file(s). ')
             return
         if 'ga_generations' in rec_config_map:
@@ -303,8 +429,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
         device_use = []
         if lib == 'np':
             cpu_use = [-1] * reconstructions
-            if no_runs > 1:
-                for _ in range(no_runs):
+            if no_scan_ranges > 1:
+                for _ in range(no_scan_ranges):
                     device_use.append(cpu_use)
             else:
                 device_use = cpu_use
@@ -312,8 +438,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
             if 'device' in rec_config_map:
                 devices = rec_config_map['device']
             else:
-                devices = [-1]
-            if no_runs * reconstructions > 1:
+                devices = 'all'
+            if no_scan_ranges * reconstructions > 1:
                 data_shape = cohere.read_tif(exp_dirs_data[0][0]).shape
                 if generations > 1:
                     if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
@@ -322,7 +448,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
                         ga_method = 'populous'
                 else:
                     ga_method = None
-                device_use = get_gpu_use(devices, no_runs, reconstructions, data_shape, 'pc' in rec_config_map['algorithm_sequence'], ga_method)
+                available_dev = ut.get_gpu_load()
+                device_use = get_gpu_use(devices, no_scan_ranges, reconstructions, data_shape, 'pc' in rec_config_map['algorithm_sequence'], ga_method)
                 # check if cluster configuration
                 if type(device_use) == dict:
                     host_file = open(experiment_dir + 'hosts.txt', mode='w+')
@@ -331,26 +458,28 @@ def manage_reconstruction(experiment_dir, rec_id=None):
                         host_file.write(host + ':' + str(len(devices)))
                         temp_dev_list.extend(devices)
                     host_file.close()
-                    device_use = temp_dev_listf
+                    device_use = temp_dev_list
             else:
                 device_use = devices
+        print('device use', device_use)
 
-        if no_runs == 1:
+        if no_scan_ranges == 1:
             if len(device_use) == 0:
                 device_use = [-1]
             dir_data = exp_dirs_data[0]
             datafile = dir_data[0]
             dir = dir_data[1]
-            if generations > 1:
-                if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
-                    cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
-                else:
-                    cohere.reconstruction_populous_GA.reconstruction(lib, conf_file, datafile, dir, device_use)
-            elif reconstructions > 1:
-                cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
-            else:
-                cohere.reconstruction_single.reconstruction(lib, conf_file, datafile, dir, device_use)
-        else:
+            manage_scan_range(generations, rec_config_map, reconstructions, lib, conf_file, datafile, dir, device_use)
+            # if generations > 1:
+            #     if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
+            #         cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
+            #     else:
+            #         cohere.reconstruction_populous_GA.reconstruction(lib, conf_file, datafile, dir, device_use)
+            # elif reconstructions > 1:
+            #     cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
+            # else:
+            #     cohere.reconstruction_single.reconstruction(lib, conf_file, datafile, dir, device_use)
+        else: # multiple scans or scan ranges
             if len(device_use) == 0:
                 device_use = [[-1]]
             else:
@@ -370,7 +499,7 @@ def manage_reconstruction(experiment_dir, rec_id=None):
             index = 0
             processes = {}
             pr = []
-            while index < no_runs:
+            while index < no_scan_ranges:
                 pid, gpus = q.get()
                 if pid is not None:
                     os.kill(pid, signal.SIGKILL)
