@@ -79,23 +79,59 @@ class Memory_broker:
         else:
             mem_map = ut.get_gpu_load(rec_mem_size, self.dev)
 
-        return mem_map
+        self.mem_map = mem_map
 
 
-    def get_avail_recs(self, mem_map):
-        if self.cluster:
-            total_avail = 0
-            for host in mem_map.keys():
-                host_available = reduce((lambda x, y: x + y), mem_map[host].values())
-                total_avail = reduce((lambda x, y: x + y), host_available.values())
+    def get_balanced_distr(self, map, no):
+        total_avail = reduce((lambda x, y: x + y), map.values())
+        if total_avail <= no:
+            return map, total_avail
         else:
-            total_avail = reduce((lambda x, y: x + y), mem_map.values())
-        return total_avail
+            factor = no * 1.0 / total_avail
+            allocated_total = 0
+            allocated = {}
+            for key, value in map.items():
+                allocated[key] = int(factor * value)
+                allocated_total += allocated[key]
+            # need allocate more to account for the fraction
+            need_allocate = no - allocated_total
+            for key in map.keys():
+                if need_allocate == 0:
+                    break
+                if allocated[key] < map[key]:
+                    allocated[key] += 1
+                    need_allocate -= 1
+            return allocated, no
 
 
-    def get_best_devs(self, n):
+    def balance_devs(self, no_rec, no_scan_ranges):
+        no_all_recs = no_rec * no_scan_ranges
+        if self.cluster:
+            host_avail = {}
+            for host in self.mem_map.keys():
+                host_avail[host] = reduce((lambda x, y: x + y), self.mem_map[host].values())
+            # find balanced distribution among hosts
+            host_distr, no_total_avail = self.get_balanced_distr(host_avail, no_all_recs)
+            if no_total_avail <= no_all_recs:
+                allocated = self.mem_map
+            host_allocated = {}
+            for host, map in host_distr.items():
 
 
+        available_recs = self.get_avail_recs()
+        if available_recs > no_rec * no_scan_ranges:
+            # distribute devices evenly in one list or list of lists for multiple scans
+            pass
+        else:
+            # not enough resources, first serialize the scans reconstructions then
+            # limit number of reconstructions in one scan
+            if no_scan_ranges == 1:
+                # return all devices in one list
+                pass
+            else:
+                # return list of lists
+                aval_scans = available_recs // no_rec
+                # distribute into aval_scans number of buckets with no_rec
 
     def get_assigned_devs(self, no_rec, no_scan_ranges, data_shape, ga_method, pc_in_use):
         # if there is only one reconstruction find a device in a simplest way
@@ -124,21 +160,8 @@ class Memory_broker:
                 return [-1]
         else:
             rec_mem_size = self.get_rec_mem(self, data_shape, ga_method, pc_in_use)
-            mem_map = self.get_mem_map(self, rec_mem_size)
-            available_recs = self.get_avail_recs()
-            if available_recs > no_rec * no_scan_ranges:
-                # distribute devices evenly in one list or list of lists for multiple scans
-                pass
-            else:
-                # not enough resources, first serialize the scans reconstructions then
-                # limit number of reconstructions in one scan
-                if no_scan_ranges == 1:
-                    # return all devices in one list
-                    pass
-                else:
-                    # return list of lists
-                    aval_scans = available_recs // no_rec
-                    # distribute into aval_scans number of buckets with no_rec
+            self.get_mem_map(self, rec_mem_size)
+            assigned = self.balance_devs(no_rec, no_scan_ranges)
 
 
 def rec_process(proc, conf_file, datafile, dir, gpus, r, q):
