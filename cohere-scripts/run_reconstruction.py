@@ -1,4 +1,6 @@
 # #########################################################################
+
+
 # Copyright (c) , UChicago Argonne, LLC. All rights reserved.             #
 #                                                                         #
 # See LICENSE file.                                                       #
@@ -82,26 +84,30 @@ class Memory_broker:
         self.mem_map = mem_map
 
 
-    def get_balanced_distr(self, map, no):
+    def get_balanced_distr(self, map, no, no_batches):
         total_avail = reduce((lambda x, y: x + y), map.values())
         if total_avail <= no:
-            return map, total_avail
+            if no_batches == 1:
+                return map, total_avail
+            else:
+                no_requested = no - no % no_batches
         else:
-            factor = no * 1.0 / total_avail
-            allocated_total = 0
-            allocated = {}
-            for key, value in map.items():
-                allocated[key] = int(factor * value)
-                allocated_total += allocated[key]
-            # need allocate more to account for the fraction
-            need_allocate = no - allocated_total
-            for key in map.keys():
-                if need_allocate == 0:
-                    break
-                if allocated[key] < map[key]:
-                    allocated[key] += 1
-                    need_allocate -= 1
-            return allocated, no
+            no_requested = no
+        factor = no_requested * 1.0 / total_avail
+        allocated_total = 0
+        allocated = {}
+        for key, value in map.items():
+            allocated[key] = int(factor * value)
+            allocated_total += allocated[key]
+        # need allocate more to account for the fraction
+        need_allocate = no_requested - allocated_total
+        for key in map.keys():
+            if need_allocate == 0:
+                break
+            if allocated[key] < map[key]:
+                allocated[key] += 1
+                need_allocate -= 1
+        return allocated, no_requested
 
 
     def balance_devs(self, no_rec, no_scan_ranges):
@@ -111,27 +117,21 @@ class Memory_broker:
             for host in self.mem_map.keys():
                 host_avail[host] = reduce((lambda x, y: x + y), self.mem_map[host].values())
             # find balanced distribution among hosts
-            host_distr, no_total_avail = self.get_balanced_distr(host_avail, no_all_recs)
+            host_distr, no_total_avail = self.get_balanced_distr(host_avail, no_all_recs, no_scan_ranges)
             if no_total_avail <= no_all_recs:
                 allocated = self.mem_map
-            host_allocated = {}
-            for host, map in host_distr.items():
-
-
-        available_recs = self.get_avail_recs()
-        if available_recs > no_rec * no_scan_ranges:
-            # distribute devices evenly in one list or list of lists for multiple scans
-            pass
-        else:
-            # not enough resources, first serialize the scans reconstructions then
-            # limit number of reconstructions in one scan
-            if no_scan_ranges == 1:
-                # return all devices in one list
-                pass
+                host_totals = host_avail
             else:
-                # return list of lists
-                aval_scans = available_recs // no_rec
-                # distribute into aval_scans number of buckets with no_rec
+                allocated = {}
+                host_totals = {}
+                for host, gpu_map in host_distr.items():
+                    balanced_gpu_map, host_total = self.get_balanced_distr(self.mem_map[host], host_distr[host], 1)
+                    allocated[host] = balanced_gpu_map
+                    host_totals[host] = host_total
+            return allocated, host_totals
+        else:
+            return self.get_balanced_distr(self.mem_map, no_all_recs, no_scan_ranges)
+
 
     def get_assigned_devs(self, no_rec, no_scan_ranges, data_shape, ga_method, pc_in_use):
         # if there is only one reconstruction find a device in a simplest way
@@ -146,22 +146,60 @@ class Memory_broker:
                     return [-1]
                 else:
                     assigned = ut.get_best_gpu()
-            return assigned
+            # returns one single gpu id
+            return assigned, 1
 
         if sys.platform == 'darwin':
             if self.cluster:
                 print('currently not supporting cluster configuration on Darwin')
-                return [-1]
+                return [-1], 0
             # the gpu library is not working on OSX, so run one reconstruction on each GPU
             try:
                 self.mem_map = {dev: [1] for dev in self.dev}
             except:
                 print('on Darwin platform the available devices must be entered as list')
-                return [-1]
-        else:
-            rec_mem_size = self.get_rec_mem(self, data_shape, ga_method, pc_in_use)
-            self.get_mem_map(self, rec_mem_size)
-            assigned = self.balance_devs(no_rec, no_scan_ranges)
+                return [-1], 0
+
+        rec_mem_size = self.get_rec_mem(self, data_shape, ga_method, pc_in_use)
+        self.get_mem_map(self, rec_mem_size)
+        # assigned below is a map of available devices and total
+        # in case of cluster it is a map of maps and a map of totals
+        assigned = self.balance_devs(no_rec, no_scan_ranges)
+        return assigned
+
+
+def find_lib(proc):
+    lib = 'np'
+    if proc == 'auto':
+        try:
+            import cupy
+            lib = 'cp'
+        except:
+            try:
+                import torch
+                lib = 'torch'
+            except:
+               pass
+    elif proc == 'cp':
+        try:
+            import cupy
+            lib = 'cp'
+        except:
+            print('cupy is not installed, select different library (proc)')
+            return None
+    elif proc == 'torch':
+        try:
+            import torch
+            lib = 'torch'
+        except:
+            print('pytorch is not installed, select different library (proc)')
+            return None
+    elif proc == 'np':
+        pass  # lib set to 'np'
+    else:
+        print('invalid "proc" value', proc, 'is not supported')
+        return None
+    return lib
 
 
 def rec_process(proc, conf_file, datafile, dir, gpus, r, q):
@@ -196,104 +234,6 @@ def rec_process(proc, conf_file, datafile, dir, gpus, r, q):
     q.put((os.getpid(), gpus))
 
 
-def get_gpu_use(devices, no_dir, no_rec, data_shape, pc_in_use, ga_method):
-    """
-    Determines the use case, available GPUs that match configured devices, and selects the optimal distribution of reconstructions on available devices.
-    Parameters
-    ----------
-    devices : list
-        list of configured GPU ids to use for reconstructions. If -1, operating system is assigning it
-    no_dir : int
-        number of directories to run independent reconstructions
-    no_rec : int
-        configured number of reconstructions to run in each directory
-    data_shape : tuple
-        shape of data array, needed to estimate how many reconstructions will fit into available memory
-    pc_in_use : boolean
-        True if partial coherence is configured
-    Returns
-    -------
-    gpu_use : list
-        a list of int indicating number of runs per consecuitive GPUs
-    """
-    from functools import reduce
-
-    no_runs = no_dir * no_rec
-    if sys.platform == 'darwin':
-        # the gpu library is not working on OSX, so run one reconstruction on each GPU
-        try:
-            gpu_load = {dev : [1] for dev in devices}
-        except:
-            print('on Darwin platform the available devices must be entered as list')
-            return [-1]
-    else:
-        # find size of data array
-        data_size = reduce((lambda x, y: x * y), data_shape) / 1000000.
-        mem_factor = MEM_FACTOR
-        c = 0
-        if ga_method is not None:
-            if ga_method == 'fast':
-                mem_factor = GA_FAST_MEM_FACTOR
-                c = 430
-            else:
-                mem_factor = GA_MEM_FACTOR
-        rec_mem_size = data_size * mem_factor + c
-        if pc_in_use:
-            rec_mem_size = rec_mem_size * 2
-        if type(devices) == dict: # a cluster with multiple hosts
-            hosts = ','.join(devices.keys())
-            # memory map returns dict with hosts keys, and value a dict of
-            # gpu Id/available runs
-            mem_map = ut.run_with_mpi(hosts, len(devices), devices, rec_mem_size)
-            # calculate number available runs on each host and distribute the no_runs
-            # proportionally
-            host_available = {}
-            for host in mem_map.keys():
-                host_available[host] = reduce((lambda x, y: x + y), mem_map[host].values())
-            total_hosts_available = reduce((lambda x, y: x + y), host_available.values())
-            if total_hosts_available > no_rec:
-                factor = no_rec * 1.0 / total_hosts_available
-            if factor < 1:
-                accounted = 0
-                host_allocated = {}
-                for host in host_available:
-                    host_allocated[host] = int(factor * host_available[host])
-                    accounted += host_allocated[host]
-                # need allocate more to account for the fraction
-                need_allocate = no_rec - accounted
-                for host in host_available:
-                    if host_allocated[host] < host_available[host]:
-                        host_allocated[host] += 1
-                        need_allocate -= 1
-                        if need_allocate == 0:
-                            break
-            else:
-                host_allocated = host_available
-            # get distribution between GPUs on each host
-            gpu_use = {}
-            for host in host_allocated:
-                gpu_distribution = ut.get_gpu_distribution(no_runs, host_allocated[host])
-                gpu_use[host] = sum([[k]*v for k,v in gpu_distribution.items()],[])
-            return gpu_use
-        else: # the processing runs on one machine
-            gpu_load = ut.get_gpu_load(rec_mem_size, devices)
-            gpu_distribution = ut.get_gpu_distribution(no_runs, gpu_load)
-            print('distr', gpu_distribution)
-            ids = list(gpu_distribution.keys())
-            gpu_use = []
-            while len(ids) > 0:
-                to_remove = [id for id in ids if gpu_distribution[id] == 0]
-                ids = [id for id in ids if id not in to_remove]
-                gpu_use.extend(ids)
-                for id in ids:
-                    gpu_distribution[id] -=1
-
-            if len(gpu_use) > no_runs:
-                gpu_use = gpu_use[:no_runs]
-
-            return gpu_use
-
-
 def manage_reconstruction(experiment_dir, rec_id=None):
     """
     This function starts the interruption discovery process and continues the recontruction processing.
@@ -310,7 +250,7 @@ def manage_reconstruction(experiment_dir, rec_id=None):
     -------
     nothing
     """
-    def manage_scan_range(generations, rec_config_map, reconstructions, lib, conf_file, datafile, dir, device_use):
+    def manage_scan_range(generations, rec_config_map, reconstructions, lib, conf_file, datafile, dir, device_use, q=None):
         if generations > 1:
             if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
                 cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
@@ -320,6 +260,9 @@ def manage_reconstruction(experiment_dir, rec_id=None):
             cohere.mpi_cmd.run_with_mpi(lib, conf_file, datafile, dir, device_use)
         else:
             cohere.reconstruction_single.reconstruction(lib, conf_file, datafile, dir, device_use)
+
+        if q is not None:
+            q.put((os.getpid(), gpus))
 
     print('starting reconstruction')
     experiment_dir = experiment_dir.replace(os.sep, '/')
@@ -364,36 +307,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
         proc = rec_config_map['processing']
     else:
         proc = 'auto'
-
-    lib = 'np'
-    if proc == 'auto':
-        try:
-            import cupy
-            lib = 'cp'
-        except:
-            try:
-                import torch
-                lib = 'torch'
-            except:
-               pass
-    elif proc == 'cp':
-        try:
-            import cupy
-            lib = 'cp'
-        except:
-            print('cupy is not installed, select different library (proc)')
-            return
-    elif proc == 'torch':
-        try:
-            import torch
-            lib = 'torch'
-        except:
-            print('pytorch is not installed, select different library (proc)')
-            return
-    elif proc == 'np':
-        pass  # lib set to 'np'
-    else:
-        print('invalid "proc" value', proc, 'is not supported')
+    lib = find_lib(proc)
+    if lib is None:
         return
 
     separate = False
@@ -402,15 +317,15 @@ def manage_reconstruction(experiment_dir, rec_id=None):
     if 'separate_scan_ranges' in main_config_map and main_config_map['separate_scan_ranges']:
         separate = True
 
+    dev = [-1]
+    if 'device' in rec_config_map:
+        dev = rec_config_map['device']
+
     # for multipeak reconstruction divert here
     if 'multipeak' in main_config_map and main_config_map['multipeak']:
         config_map = ut.read_config(experiment_dir + "/conf/config_mp")
         config_map.update(main_config_map)
         config_map.update(rec_config_map)
-        if 'device' in config_map:
-            dev = config_map['device']
-        else:
-            dev = [-1]
         peak_dirs = []
         for dir in os.listdir(experiment_dir):
             if dir.startswith('mp'):
@@ -441,14 +356,21 @@ def manage_reconstruction(experiment_dir, rec_id=None):
         if no_scan_ranges == 0:
             print('did not find data.tif file(s). ')
             return
+
+        ga_method = None
         if 'ga_generations' in rec_config_map:
             generations = rec_config_map['ga_generations']
+            if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
+                ga_method = 'fast'
+            else:
+                ga_method = 'populous'
         else:
             generations = 0
         if 'reconstructions' in rec_config_map:
             reconstructions = rec_config_map['reconstructions']
         else:
             reconstructions = 1
+
         device_use = []
         if lib == 'np':
             cpu_use = [-1] * reconstructions
@@ -458,37 +380,28 @@ def manage_reconstruction(experiment_dir, rec_id=None):
             else:
                 device_use = cpu_use
         else:
-            if 'device' in rec_config_map:
-                devices = rec_config_map['device']
+            mb = Memory_broker(dev)
+            data_shape = cohere.read_tif(exp_dirs_data[0][0]).shape
+            assigned, assig_no = mb.get_assigned_devs(reconstructions, no_scan_ranges, data_shape, ga_method, 'pc' in rec_config_map['algorithm_sequence'])
+            temp_dev_list = []
+            # check if cluster configuration
+            if type(dev) == dict:
+                host_file = open(experiment_dir + 'hosts.txt', mode='w+')
+                for host, devices_map in assigned.items():
+                    host_file.write(host + ':' + str(assig_no[host]))
+                    temp_dev_list += sum([[dev_id] * no for dev_id, no in devices_map.items()], [])
+                host_file.close()
             else:
-                devices = 'all'
-            if no_scan_ranges * reconstructions > 1:
-                data_shape = cohere.read_tif(exp_dirs_data[0][0]).shape
-                if generations > 1:
-                    if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
-                        ga_method = 'fast'
-                    else:
-                        ga_method = 'populous'
+                if assig_no == 0:
+                    return
+                elif assig_no == 1:
+                    temp_dev_list = assigned
                 else:
-                    ga_method = None
-                available_dev = ut.get_gpu_load()
-                device_use = get_gpu_use(devices, no_scan_ranges, reconstructions, data_shape, 'pc' in rec_config_map['algorithm_sequence'], ga_method)
-                # check if cluster configuration
-                if type(device_use) == dict:
-                    host_file = open(experiment_dir + 'hosts.txt', mode='w+')
-                    temp_dev_list = []
-                    for host, devices in device_use.items():
-                        host_file.write(host + ':' + str(len(devices)))
-                        temp_dev_list.extend(devices)
-                    host_file.close()
-                    device_use = temp_dev_list
-            else:
-                device_use = devices
-        print('device use', device_use)
+                    temp_dev_list = sum([[dev_id] * no for dev_id, no in assigned.items()], [])
+        print('temp_dev_list', temp_dev_list)
 
         if no_scan_ranges == 1:
-            if len(device_use) == 0:
-                device_use = [-1]
+            device_use = temp_dev_list
             dir_data = exp_dirs_data[0]
             datafile = dir_data[0]
             dir = dir_data[1]
@@ -505,10 +418,13 @@ def manage_reconstruction(experiment_dir, rec_id=None):
         else: # multiple scans or scan ranges
             if len(device_use) == 0:
                 device_use = [[-1]]
+            elif len(device_use) <= reconstructions * no_scan_ranges:
+                device_use = [device_use]
+                no_chunks = 1
             else:
-                # check if is it worth to use last chunk
-                if lib != 'np' and len(device_use[0]) > len(device_use[-1]) * 2:
-                    device_use = device_use[0:-1]
+                # divide the list into sub-lists of number of reconstructions length
+                device_use = [device_use[x : x+reconstructions] for x in range(0, len(device_use), reconstructions)]
+
             if generations > 1:
                 r = 'g'
             elif reconstructions > 1:
@@ -529,7 +445,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
                     del processes[pid]
                 datafile = exp_dirs_data[index][0]
                 dir = exp_dirs_data[index][1]
-                p = Process(target=rec_process, args=(lib, conf_file, datafile, dir, gpus, r, q))
+                # p = Process(target=rec_process, args=(lib, conf_file, datafile, dir, gpus, r, q))
+                p = Process(target=manage_scan_range, args=(generations, rec_config_map, reconstructions, lib, conf_file, datafile, dir, device_use, q))
                 p.start()
                 pr.append(p)
                 processes[p.pid] = index
@@ -559,4 +476,3 @@ def main(arg):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
-
