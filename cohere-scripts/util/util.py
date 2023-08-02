@@ -388,13 +388,14 @@ def get_gpu_load(mem_size, dev):
     available = {}
 
     for gpu in gpus:
+      #  print('dev', dev)
         if dev == 'all' or gpu.id in dev:
             free_mem = gpu.memoryFree
             avail_runs = int(free_mem / mem_size)
             if avail_runs > 0:
                 available[gpu.id] = avail_runs
 
-    print(available)
+  #  print(available)
     return available
 
 

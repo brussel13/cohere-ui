@@ -25,11 +25,22 @@ import os
 import argparse
 from multiprocessing import Process, Queue
 import cohere_core as cohere
-import util.util as ut
 import convertconfig as conv
 from functools import reduce
 import subprocess
 import ast
+import datetime
+
+def write_log(rank: int, msg: str) -> None:
+    """
+    Use this to force writes for debugging. PBS sometimes doesn't flush
+    std* outputs. MPI faults clobber greedy flushing of default python
+    logs.
+    """
+    with open(f'{rank}.log', 'a') as log_f:
+        log_f.write(f'{datetime.datetime.now()} | {msg}\n')
+
+
 
 
 class Memory_broker:
@@ -43,6 +54,7 @@ class Memory_broker:
             self.cluster = True # a cluster with multiple hosts
         else:
             self.cluster = False
+        print('self dev constr', self.dev)
 
 
     def get_rec_mem(self, data_shape, ga_method, pc_in_use):
@@ -63,23 +75,73 @@ class Memory_broker:
         return rec_mem_size
 
 
+    def get_best_gpu(self):
+        import GPUtil
+
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        gpus = GPUtil.getGPUs()
+        best_id = -1
+        best_mem = 0
+
+        for gpu in gpus:
+            free_mem = gpu.memoryFree
+            if free_mem > best_mem:
+                best_mem = free_mem
+                best_id = gpu.id
+
+        return best_id
+
+
+    def get_gpu_load(self, mem_size, ids):
+        """
+        This function is only used when running on Linux OS. The GPUtil module is not supported on Mac.
+        This function finds available GPU memory in each GPU that id is included in ids list. It calculates
+        how many reconstruction can fit in each GPU available memory.
+        Parameters
+        ----------
+        mem_size : int
+            array size
+        ids : list
+            list of GPU ids user configured for use
+        Returns
+        -------
+        list
+            list of available runs aligned with the GPU id list
+        """
+        import GPUtil
+
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        gpus = GPUtil.getGPUs()
+        available = {}
+
+        for gpu in gpus:
+            if dev == 'all' or gpu.id in dev:
+                free_mem = gpu.memoryFree
+                avail_runs = int(free_mem / mem_size)
+                if avail_runs > 0:
+                    available[gpu.id] = avail_runs
+
+        print(available)
+        return available
+
+
     def get_mem_map(self, rec_mem_size):
         if self.cluster: # a cluster with multiple hosts
             hosts = ','.join(self.dev.keys())
-            script = 'util.mpi_cmd.py'
-            command = ['mpiexec', '-n', str(len(self.dev)), '--host', hosts, 'python', script, str(rec_mem_size), self.dev]
+            script = 'cohere-scripts/util/mpi_cmd.py'
+            command = ['mpiexec', '-n', str(len(self.dev)), '--host', hosts, 'python', script, str(rec_mem_size), str(self.dev)]
             result = subprocess.run(command, stdout=subprocess.PIPE)
             mem = result.stdout.decode("utf-8").strip()
             mem_map = {}
             for line in mem.splitlines():
                 entry = line.split(" ", 1)
-                # print('entry', entry)
                 mem_map[entry[0]] = ast.literal_eval(entry[1])
             # memory map contains dict with hosts keys, and value a dict of
             # gpu Id/available runs
-            print(mem_map)
+            print('hosts mem map after parsing', mem_map)
         else:
-            mem_map = ut.get_gpu_load(rec_mem_size, self.dev)
+            print('self dev', self.dev)
+            mem_map = self.get_gpu_load(rec_mem_size, self.dev)
 
         self.mem_map = mem_map
 
@@ -114,8 +176,9 @@ class Memory_broker:
         no_all_recs = no_rec * no_scan_ranges
         if self.cluster:
             host_avail = {}
-            for host in self.mem_map.keys():
-                host_avail[host] = reduce((lambda x, y: x + y), self.mem_map[host].values())
+            for host, host_dev_map in self.mem_map.items():
+                print('host, dev map', host, host_dev_map)
+                host_avail[host] = reduce((lambda x, y: x + y), host_dev_map.values())
             # find balanced distribution among hosts
             host_distr, no_total_avail = self.get_balanced_distr(host_avail, no_all_recs, no_scan_ranges)
             if no_total_avail <= no_all_recs:
@@ -145,7 +208,7 @@ class Memory_broker:
                     print('currently not supporting "all" configuration on Darwin')
                     return [-1]
                 else:
-                    assigned = ut.get_best_gpu()
+                    assigned = self.get_best_gpu()
             # returns one single gpu id
             return assigned, 1
 
@@ -160,11 +223,13 @@ class Memory_broker:
                 print('on Darwin platform the available devices must be entered as list')
                 return [-1], 0
 
-        rec_mem_size = self.get_rec_mem(self, data_shape, ga_method, pc_in_use)
-        self.get_mem_map(self, rec_mem_size)
+        rec_mem_size = self.get_rec_mem(data_shape, ga_method, pc_in_use)
+        self.get_mem_map(rec_mem_size)
+        print('mem map', self.mem_map)
         # assigned below is a map of available devices and total
         # in case of cluster it is a map of maps and a map of totals
         assigned = self.balance_devs(no_rec, no_scan_ranges)
+        print('assigned',assigned)
         return assigned
 
 
@@ -250,6 +315,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
     -------
     nothing
     """
+    import util.util as ut
+
     def manage_scan_range(generations, rec_config_map, reconstructions, lib, conf_file, datafile, dir, device_use, q=None):
         if generations > 1:
             if 'ga_fast' in rec_config_map and rec_config_map['ga_fast']:
@@ -321,6 +388,8 @@ def manage_reconstruction(experiment_dir, rec_id=None):
     if 'device' in rec_config_map:
         dev = rec_config_map['device']
 
+    print('parsed dev',dev)
+
     # for multipeak reconstruction divert here
     if 'multipeak' in main_config_map and main_config_map['multipeak']:
         config_map = ut.read_config(experiment_dir + "/conf/config_mp")
@@ -380,6 +449,7 @@ def manage_reconstruction(experiment_dir, rec_id=None):
             else:
                 device_use = cpu_use
         else:
+            print('dev creating', dev)
             mb = Memory_broker(dev)
             data_shape = cohere.read_tif(exp_dirs_data[0][0]).shape
             assigned, assig_no = mb.get_assigned_devs(reconstructions, no_scan_ranges, data_shape, ga_method, 'pc' in rec_config_map['algorithm_sequence'])
